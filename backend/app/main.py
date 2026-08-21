@@ -99,6 +99,11 @@ async def convert_image(
 
     try:
         result = process_image(file_bytes, params)
+    except MemoryError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Server out of memory — try a smaller image (under ~1600px).",
+        ) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Processing failed: {exc}") from exc
 

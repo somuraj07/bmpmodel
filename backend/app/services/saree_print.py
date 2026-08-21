@@ -31,18 +31,49 @@ def _hue_diff(a: np.ndarray, b: np.ndarray) -> float:
 def _kmeans_lab(lab: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray, float]:
     samples = lab.reshape(-1, 3)
     k = max(2, min(int(k), max(2, samples.shape[0] - 1)))
-    if samples.shape[0] > 160_000:
+    # Keep fit set small — free Render is ~512MB and times out ~100s.
+    max_fit = 40_000
+    if samples.shape[0] > max_fit:
         rng = np.random.default_rng(5)
-        fit = samples[rng.choice(samples.shape[0], 160_000, replace=False)]
+        fit = samples[rng.choice(samples.shape[0], max_fit, replace=False)]
     else:
         fit = samples
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 80, 0.2)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.4)
     compactness, _, centers = cv2.kmeans(
-        fit, k, None, criteria, 8, cv2.KMEANS_PP_CENTERS
+        fit, k, None, criteria, 3, cv2.KMEANS_PP_CENTERS
     )
-    diffs = samples[:, None, :] - centers[None, :, :]
-    labels = np.argmin(np.sum(diffs * diffs, axis=2), axis=1).reshape(lab.shape[:2])
-    return centers.astype(np.float32), labels.astype(np.int32), float(compactness)
+    # Chunked assign — avoids one huge (N x K) temp array.
+    labels = np.empty(samples.shape[0], dtype=np.int32)
+    step = 50_000
+    centers_f = centers.astype(np.float32)
+    for i in range(0, samples.shape[0], step):
+        chunk = samples[i : i + step]
+        diffs = chunk[:, None, :] - centers_f[None, :, :]
+        labels[i : i + step] = np.argmin(np.sum(diffs * diffs, axis=2), axis=1)
+    return centers_f, labels.reshape(lab.shape[:2]), float(compactness)
+
+
+def _best_k(lab: np.ndarray, chroma_frac: float) -> int:
+    # Fast heuristic — no multi-k elbow (that alone can take minutes on free tier).
+    if chroma_frac >= 0.35:
+        return 10
+    if chroma_frac >= 0.20:
+        return 8
+    if chroma_frac >= 0.08:
+        return 5
+    return 4
+
+
+def estimate_print_colors(rgb: np.ndarray) -> int:
+    h, w = rgb.shape[:2]
+    scale = max(h, w)
+    if scale > 400:
+        f = 400 / scale
+        rgb = cv2.resize(rgb, (max(8, int(w * f)), max(8, int(h * f))), interpolation=cv2.INTER_AREA)
+    denoise = cv2.medianBlur(rgb, 3)
+    lab = _to_lab(denoise)
+    chroma = np.hypot(lab[:, :, 1] - 128.0, lab[:, :, 2] - 128.0)
+    return _best_k(lab, float(np.mean(chroma > 16)))
 
 
 def _agglomerative_merge(
@@ -101,39 +132,6 @@ def _agglomerative_merge(
             seen.add(r)
             roots.append(pal[r])
     return np.stack(roots, axis=0) if roots else centers
-
-
-def _best_k(lab: np.ndarray, chroma_frac: float) -> int:
-    prev = None
-    drops: list[float] = []
-    for k in range(2, 11):
-        _, _, compact = _kmeans_lab(lab, k)
-        if prev is not None:
-            drops.append(prev - compact)
-        prev = compact
-    if not drops:
-        return 5
-    first = max(drops[0], 1.0)
-    k = 3
-    threshold = 0.12 if chroma_frac >= 0.30 else 0.18
-    for i, drop in enumerate(drops):
-        next_k = i + 3
-        if drop < threshold * first:
-            k = max(3, next_k - 1)
-            break
-        k = next_k
-    if chroma_frac >= 0.25:
-        k = max(k, 10)
-    else:
-        k = min(k, 6)
-    return int(np.clip(k, 3, 12))
-
-
-def estimate_print_colors(rgb: np.ndarray) -> int:
-    denoise = cv2.medianBlur(rgb, 3)
-    lab = _to_lab(denoise)
-    chroma = np.hypot(lab[:, :, 1] - 128.0, lab[:, :, 2] - 128.0)
-    return _best_k(lab, float(np.mean(chroma > 16)))
 
 
 def _snap_neutral_mids(palette: np.ndarray, labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -297,21 +295,44 @@ def _remove_specks(labels: np.ndarray, palette: np.ndarray | None = None) -> np.
 
 def _relabel_to_palette(lab: np.ndarray, palette_lab: np.ndarray) -> np.ndarray:
     samples = lab.reshape(-1, 3)
-    diffs = samples[:, None, :] - palette_lab[None, :, :]
-    return np.argmin(np.sum(diffs * diffs, axis=2), axis=1).reshape(lab.shape[:2]).astype(np.int32)
+    labels = np.empty(samples.shape[0], dtype=np.int32)
+    step = 50_000
+    pal = palette_lab.astype(np.float32)
+    for i in range(0, samples.shape[0], step):
+        chunk = samples[i : i + step]
+        diffs = chunk[:, None, :] - pal[None, :, :]
+        labels[i : i + step] = np.argmin(np.sum(diffs * diffs, axis=2), axis=1)
+    return labels.reshape(lab.shape[:2])
 
 
 def _collapse_uniform_blocks(rgb: np.ndarray) -> np.ndarray:
     """If the file is already NN-upscaled pixel art, recover 1 pixel per block."""
     h, w = rgb.shape[:2]
-    for n in range(16, 1, -1):
+    # Skip on large photos — reshape+scan is expensive and rarely helps.
+    if h * w > 900_000:
+        return rgb
+    for n in (8, 6, 4, 3, 2):
         if h % n or w % n:
             continue
         blocks = rgb.reshape(h // n, n, w // n, n, 3)
+        # Sample check first
+        ys = min(40, h // n)
+        xs = min(40, w // n)
+        sample = blocks[:ys, :, :xs, :, :]
+        if float(np.all(sample == sample[:, :1, :, :1, :], axis=(1, 3)).mean()) < 0.90:
+            continue
         frac = float(np.all(blocks == blocks[:, :1, :, :1, :], axis=(1, 3)).mean())
         if frac >= 0.90:
             return blocks[:, 0, :, 0].copy()
     return rgb
+
+
+def _fast_unique_count(rgb: np.ndarray) -> int:
+    flat = rgb.reshape(-1, 3)
+    if flat.shape[0] > 80_000:
+        rng = np.random.default_rng(3)
+        flat = flat[rng.choice(flat.shape[0], 80_000, replace=False)]
+    return int(np.unique(flat, axis=0).shape[0])
 
 
 _PIXEL_CELL = {"soft": 2, "medium": 3, "hard": 4, "extreme": 6}
@@ -323,18 +344,27 @@ def to_saree_print_layout(
     color_count: int | None = None,
 ) -> tuple[np.ndarray, int]:
     """
-    Mill BMP look (com sreeekaaa 245): each design pixel is a large solid square.
-    1. Snap to a coarse grid (block size)
-    2. Limited solid inks
-    3. Nearest-neighbor expand — never bilinear
+    Mill BMP look: coarse grid → solid inks → nearest-neighbor squares.
+    Tuned for free-tier hosts (fast, low memory).
     """
     rgb = _collapse_uniform_blocks(rgb)
-    unique = int(np.unique(rgb.reshape(-1, 3), axis=0).shape[0])
+    unique = _fast_unique_count(rgb)
     if unique <= 24:
         return rgb, unique
 
     cell = int(_PIXEL_CELL.get(block_strength, 4))
     h, w = rgb.shape[:2]
+    # Cap working resolution so k-means stays under free Render limits.
+    longest = max(h, w)
+    if longest > 1400:
+        f = 1400 / longest
+        rgb = cv2.resize(
+            rgb,
+            (max(8, int(w * f)), max(8, int(h * f))),
+            interpolation=cv2.INTER_AREA,
+        )
+        h, w = rgb.shape[:2]
+
     sw = max(8, w // cell)
     sh = max(8, h // cell)
     small = cv2.resize(rgb, (sw, sh), interpolation=cv2.INTER_AREA)
@@ -345,7 +375,7 @@ def to_saree_print_layout(
     k = int(color_count) if color_count else _best_k(lab, chroma_frac)
     k = int(np.clip(k, 3, 12))
 
-    start_k = min(12, max(k, 8 if chroma_frac >= 0.25 else k))
+    start_k = min(10, max(k, 8 if chroma_frac >= 0.25 else k))
     centers, labels, _ = _kmeans_lab(lab, start_k)
     merged_lab = _agglomerative_merge(
         centers,

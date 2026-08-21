@@ -77,9 +77,21 @@ def process_image(
     file_bytes: bytes,
     params: WeavingParams | None = None,
 ) -> ProcessingResult:
+    import gc
+
     params = params or WeavingParams()
     original_rgb = decode_to_rgb(file_bytes)
     orig_h, orig_w = original_rgb.shape[:2]
+
+    # Cap decode size early — free hosts OOM/timeout on multi‑MP photos.
+    longest = max(orig_h, orig_w)
+    if longest > 1600:
+        f = 1600 / longest
+        original_rgb = cv2.resize(
+            original_rgb,
+            (max(8, int(orig_w * f)), max(8, int(orig_h * f))),
+            interpolation=cv2.INTER_AREA,
+        )
 
     use_grid = params.hooks is not None and params.reeds is not None
     auto_sized = False
@@ -195,9 +207,11 @@ def process_image(
         grid=grid,
     )
 
-    return ProcessingResult(
+    result = ProcessingResult(
         bmp_bytes=bmp_bytes,
         preview_bytes=preview_bytes,
         metadata=metadata,
         corrected_grayscale=final_gray,
     )
+    gc.collect()
+    return result

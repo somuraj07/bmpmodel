@@ -10,11 +10,17 @@ const nextConfig = {
     }
     return config;
   },
+  // Optional local proxy only in development.
+  // Production calls NEXT_PUBLIC_API_BASE_URL directly (avoids Vercel timeout).
   async rewrites() {
+    if (process.env.NODE_ENV === "production") {
+      return [];
+    }
+    const backend = process.env.BACKEND_URL || "http://localhost:8000";
     return [
       {
         source: "/api/:path*",
-        destination: "http://localhost:8000/api/:path*",
+        destination: `${backend}/api/:path*`,
       },
     ];
   },

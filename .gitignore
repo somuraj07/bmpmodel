@@ -4,11 +4,14 @@ __pycache__/
 *.pyc
 *.pyo
 .env
+backend/.env
 
 # Node
 frontend/node_modules/
 frontend/.next/
 frontend/out/
+frontend/.env.local
+frontend/.env*.local
 
 # OS
 .DS_Store

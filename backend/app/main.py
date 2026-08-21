@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from typing import Optional
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -12,15 +14,27 @@ from app.models.schemas import WeavingParams
 from app.services.image_validator import validate_image, validate_weaving_params
 from app.services.pipeline import process_image
 
+load_dotenv()
+
 app = FastAPI(
     title="Intelligent Textile Design Rasterization API",
     description="Convert images to production-ready BMP with weaving grid optimization",
     version="1.0.0",
 )
 
+
+def _cors_origins() -> list[str]:
+    raw = os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000",
+    )
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    return origins or ["http://localhost:3000"]
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

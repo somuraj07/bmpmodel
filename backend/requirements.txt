@@ -5,3 +5,4 @@ pillow==11.1.0
 numpy==2.2.2
 opencv-contrib-python-headless==4.10.0.84
 pydantic==2.10.4
+python-dotenv==1.0.1

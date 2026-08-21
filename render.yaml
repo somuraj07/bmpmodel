@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: bmpmode-api
+    runtime: docker
+    plan: free
+    # Dockerfile is at repo root (monorepo)
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      - key: CORS_ORIGINS
+        sync: false
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 8000

@@ -5,7 +5,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 const HOOKS_OPTIONS = [240, 480, 720, 960];
 const REEDS_OPTIONS = [50, 52, 54, 56, 58, 60, 64, 66, 68, 70, 72, 78, 80, 90, 92, 100, 104, 110, 120, 144, 160];
 const ZOOM_STEPS = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 48, 64];
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api";
+
+function resolveApiBaseUrl(): string {
+  const raw = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api").trim().replace(/\/+$/, "");
+  // Accept either https://host or https://host/api — always end with /api
+  if (raw.endsWith("/api")) return raw;
+  return `${raw}/api`;
+}
+
+const API_BASE_URL = resolveApiBaseUrl();
 
 function MinusIcon() {
   return (

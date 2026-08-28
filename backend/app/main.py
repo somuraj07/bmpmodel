@@ -10,9 +10,11 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
-from app.models.schemas import WeavingParams
+from app.models.schemas import BwPreviewResponse, WeavingParams
 from app.services.image_validator import validate_image, validate_weaving_params
 from app.services.pipeline import process_image
+from app.services.image_decoder import decode_to_rgb
+from app.services.bw_preview import generate_bw_previews
 
 load_dotenv()
 
@@ -46,6 +48,31 @@ def health():
     return {"status": "ok", "service": "bmp-rasterization"}
 
 
+@app.post("/api/bw-preview")
+async def bw_preview(file: UploadFile = File(...)):
+    """Generate multiple B&W clarity options for the user to pick before BMP conversion."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided.")
+
+    file_bytes = await file.read()
+    try:
+        meta = validate_image(file_bytes, file.filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        rgb = decode_to_rgb(file_bytes)
+        variants = generate_bw_previews(rgb)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"B&W preview failed: {exc}") from exc
+
+    return BwPreviewResponse(
+        variants=variants,
+        source_width=meta.width,
+        source_height=meta.height,
+    )
+
+
 @app.post("/api/convert")
 async def convert_image(
     file: UploadFile = File(...),
@@ -64,6 +91,7 @@ async def convert_image(
     layout_mode: str = Form("saree_print"),
     block_strength: str = Form("hard"),
     ml_clarity: bool = Form(True),
+    bw_variant: Optional[str] = Form(None),
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided.")
@@ -91,6 +119,7 @@ async def convert_image(
         layout_mode=layout_mode,
         block_strength=block_strength,
         ml_clarity=ml_clarity,
+        bw_variant=bw_variant or None,
     )
 
     valid, msg = validate_weaving_params(hooks, reeds)
@@ -142,6 +171,7 @@ async def convert_and_download(
     layout_mode: str = Form("saree_print"),
     block_strength: str = Form("hard"),
     ml_clarity: bool = Form(True),
+    bw_variant: Optional[str] = Form(None),
 ):
     file_bytes = await file.read()
 
@@ -166,6 +196,7 @@ async def convert_and_download(
         layout_mode=layout_mode,
         block_strength=block_strength,
         ml_clarity=ml_clarity,
+        bw_variant=bw_variant or None,
     )
 
     valid, msg = validate_weaving_params(hooks, reeds)

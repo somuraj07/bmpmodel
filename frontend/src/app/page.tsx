@@ -195,6 +195,17 @@ function PixelZoomPreview({ src }: { src: string; alt: string }) {
   );
 }
 
+interface BwPreviewVariant {
+  id: string;
+  name: string;
+  description: string;
+  sharpness: number;
+  preview_base64: string;
+  width: number;
+  height: number;
+  recommended: boolean;
+}
+
 interface ConversionResult {
   preview_base64: string;
   metadata: {
@@ -218,6 +229,7 @@ interface ConversionResult {
     is_raw_photo?: boolean;
     estimated_design_colors?: number;
     design_cropped?: boolean;
+    bw_variant?: string | null;
     grid?: {
       width: number;
       height: number;
@@ -255,6 +267,10 @@ export default function Home() {
   const [layoutMode, setLayoutMode] = useState<"color" | "bw" | "pixel_art" | "saree_print">("saree_print");
   const [blockStrength, setBlockStrength] = useState<"soft" | "medium" | "hard" | "extreme">("hard");
   const [mlClarity, setMlClarity] = useState(false);
+  const [bwPickerEnabled, setBwPickerEnabled] = useState(true);
+  const [bwVariants, setBwVariants] = useState<BwPreviewVariant[]>([]);
+  const [selectedBwVariant, setSelectedBwVariant] = useState<string | null>(null);
+  const [bwLoading, setBwLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const parseResponseBody = async (res: Response) => {
@@ -290,8 +306,43 @@ export default function Home() {
     setFile(selected);
     setResult(null);
     setError(null);
+    setBwVariants([]);
+    setSelectedBwVariant(null);
     setPreviewUrl(URL.createObjectURL(selected));
   }, []);
+
+  const fetchBwPreviews = useCallback(async (uploaded: File) => {
+    setBwLoading(true);
+    setError(null);
+    try {
+      const fd = new FormData();
+      fd.append("file", uploaded);
+      const res = await fetch(`${API_BASE_URL}/bw-preview`, { method: "POST", body: fd });
+      const body = await parseResponseBody(res);
+      if (!res.ok) {
+        throw new Error(extractErrorMessage(body, "B&W preview failed"));
+      }
+      const variants = (body as { variants: BwPreviewVariant[] }).variants;
+      setBwVariants(variants);
+      const recommended = variants.find((v) => v.recommended);
+      setSelectedBwVariant(recommended?.id ?? variants[0]?.id ?? null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "B&W preview failed");
+      setBwVariants([]);
+      setSelectedBwVariant(null);
+    } finally {
+      setBwLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!file || !bwPickerEnabled) {
+      setBwVariants([]);
+      setSelectedBwVariant(null);
+      return;
+    }
+    fetchBwPreviews(file);
+  }, [file, bwPickerEnabled, fetchBwPreviews]);
 
   const buildFormData = useCallback(() => {
     const fd = new FormData();
@@ -311,8 +362,11 @@ export default function Home() {
     fd.append("layout_mode", layoutMode);
     fd.append("block_strength", blockStrength);
     fd.append("ml_clarity", String(mlClarity));
+    if (bwPickerEnabled && selectedBwVariant) {
+      fd.append("bw_variant", selectedBwVariant);
+    }
     return fd;
-  }, [file, useGrid, hooks, reeds, shuttle, enableCorrection, autoSize, hdOutput, hdMinLongest, pixelClean, maxColors, layoutMode, blockStrength, mlClarity]);
+  }, [file, useGrid, hooks, reeds, shuttle, enableCorrection, autoSize, hdOutput, hdMinLongest, pixelClean, maxColors, layoutMode, blockStrength, mlClarity, bwPickerEnabled, selectedBwVariant]);
 
   const handleConvert = async () => {
     if (!file) return;
@@ -380,6 +434,8 @@ export default function Home() {
                 setPreviewUrl(URL.createObjectURL(dropped));
                 setResult(null);
                 setError(null);
+                setBwVariants([]);
+                setSelectedBwVariant(null);
               }
             }}
           >
@@ -402,7 +458,89 @@ export default function Home() {
         </section>
 
         <section className="panel">
-          <h2>2. Output Quality</h2>
+          <h2>2. Black &amp; White Picker</h2>
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={bwPickerEnabled}
+              onChange={(e) => {
+                setBwPickerEnabled(e.target.checked);
+                setResult(null);
+              }}
+            />
+            Compare B&amp;W clarity options first (7 variants — pick the clearest, then convert to BMP)
+          </label>
+          {bwPickerEnabled && (
+            <>
+              <p className="hint" style={{ marginTop: "0.5rem" }}>
+                Upload a design, choose the sharpest black &amp; white version, then convert to BMP below.
+              </p>
+              {!file && <p className="hint">Upload an image to generate B&amp;W options.</p>}
+              {file && bwLoading && <p className="hint">Generating 7 B&amp;W clarity options…</p>}
+              {file && !bwLoading && bwVariants.length > 0 && (
+                <>
+                  <p className="bwPickerHint">Click one image to select it — highlighted card will be used for BMP conversion.</p>
+                  <div className="bwPickerGrid" role="listbox" aria-label="Black and white clarity options">
+                    {bwVariants.map((variant) => {
+                      const isSelected = selectedBwVariant === variant.id;
+                      return (
+                        <button
+                          key={variant.id}
+                          type="button"
+                          role="option"
+                          aria-selected={isSelected}
+                          className={`bwOption ${isSelected ? "bwOptionSelected" : ""}`}
+                          onClick={() => {
+                            setSelectedBwVariant(variant.id);
+                            setResult(null);
+                          }}
+                        >
+                          <div className="bwOptionFrame">
+                            <img
+                              src={`data:image/png;base64,${variant.preview_base64}`}
+                              alt={variant.name}
+                              className="bwOptionImg"
+                            />
+                            {isSelected && (
+                              <span className="bwSelectedMark" aria-hidden="true">
+                                ✓
+                              </span>
+                            )}
+                          </div>
+                          <div className="bwOptionTitle">{variant.name}</div>
+                          <div className="bwOptionMeta">Clarity: {variant.sharpness.toFixed(0)}</div>
+                          {isSelected && <span className="bwSelectedLabel">Selected</span>}
+                          {!isSelected && variant.recommended && (
+                            <span className="bwBadge">Best clarity</span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="bwPickerActions">
+                    <button
+                      type="button"
+                      className="secondaryBtn"
+                      onClick={() => file && fetchBwPreviews(file)}
+                      disabled={!file || bwLoading}
+                    >
+                      Regenerate options
+                    </button>
+                    {selectedBwVariant && (
+                      <span className="bwSelectedSummary">
+                        Ready to convert:{" "}
+                        <strong>{bwVariants.find((v) => v.id === selectedBwVariant)?.name}</strong>
+                      </span>
+                    )}
+                  </div>
+                </>
+              )}
+            </>
+          )}
+        </section>
+
+        <section className="panel">
+          <h2>3. Output Quality</h2>
           <div className="params">
             <div className="field layoutModeField">
               <label>Layout mode</label>
@@ -504,7 +642,7 @@ export default function Home() {
         </section>
 
         <section className="panel">
-          <h2>3. Weaving Parameters</h2>
+          <h2>4. Weaving Parameters</h2>
           <label className="toggle">
             <input type="checkbox" checked={useGrid} onChange={(e) => setUseGrid(e.target.checked)} />
             Apply weaving grid mapping (Hooks × Reeds)
@@ -558,14 +696,14 @@ export default function Home() {
         </section>
 
         <section className="panel">
-          <h2>4. Convert &amp; Download</h2>
+          <h2>5. Convert &amp; Download</h2>
           <div className="actions">
             <button
               className="primaryBtn"
               onClick={handleConvert}
-              disabled={!file || loading}
+              disabled={!file || loading || (bwPickerEnabled && !selectedBwVariant)}
             >
-              {loading ? "Processing…" : "Convert to BMP"}
+              {loading ? "Processing…" : bwPickerEnabled ? "Convert selected B&W to BMP" : "Convert to BMP"}
             </button>
             {result && (
               <button className="secondaryBtn" onClick={handleDownload} disabled={loading}>
@@ -601,6 +739,9 @@ export default function Home() {
                   <div><strong>Auto-size:</strong> {result.metadata.auto_sized ? "Yes" : "No"}</div>
                   <div><strong>HD upscale:</strong> {result.metadata.hd_applied ? `${result.metadata.hd_scale}×` : "No (already HD)"}</div>
                   <div><strong>Layout mode:</strong> {result.metadata.layout_mode === "bw" ? "Black & White" : result.metadata.layout_mode === "pixel_art" ? "Pixel Art" : result.metadata.layout_mode === "saree_print" ? "Saree machine print" : "Color"}</div>
+                  {result.metadata.bw_variant && (
+                    <div><strong>B&amp;W variant:</strong> {bwVariants.find((v) => v.id === result.metadata.bw_variant)?.name ?? result.metadata.bw_variant}</div>
+                  )}
                   <div><strong>Pixel color clarity:</strong> {result.metadata.pixel_clean_applied ? `Yes (${result.metadata.palette_colors} solid colors)` : "No"}</div>
                   <div><strong>ML clarity:</strong> {result.metadata.ml_applied ? `Yes (FSRCNN ${result.metadata.ml_scale}×)` : "No"}</div>
                   <div><strong>Raw photo analysis:</strong> {result.metadata.is_raw_photo ? `Yes → ${result.metadata.estimated_design_colors} design colors${result.metadata.design_cropped ? ", cropped" : ""}` : "No (already a design)"}</div>

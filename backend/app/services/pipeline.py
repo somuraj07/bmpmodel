@@ -22,7 +22,7 @@ from app.services.pattern_corrector import correct_pattern, restore_features
 from app.services.ml_clarity import enhance_with_ml
 from app.services.pixel_cleaner import clean_pixels, quantize_to_solid_pixels
 from app.services.saree_print import to_saree_print_layout
-from app.services.weaving_calculator import calculate_grid
+from app.services.bw_preview import apply_bw_variant
 
 
 @dataclass
@@ -144,13 +144,20 @@ def process_image(
     if is_raw_photo and layout_mode == "color":
         layout_mode = "saree_print"
 
+    bw_variant_applied: str | None = None
+    if params.bw_variant:
+        final_rgb = apply_bw_variant(final_rgb, params.bw_variant)
+        bw_variant_applied = params.bw_variant
+        is_raw_photo = False
+        finishing_applied = True
+
     # Recover clarity from low-quality source inputs before layout quantization.
-    if params.ml_clarity and layout_mode != "saree_print":
+    if params.ml_clarity and layout_mode != "saree_print" and not bw_variant_applied:
         final_rgb, ml_applied, ml_scale = enhance_with_ml(final_rgb)
         if ml_applied:
             finishing_applied = True
     # CLAHE/unsharp adds extra shades — skip it for weaving pixel-art BMPs.
-    if params.enable_finishing and layout_mode not in ("pixel_art", "saree_print"):
+    if params.enable_finishing and layout_mode not in ("pixel_art", "saree_print") and not bw_variant_applied:
         final_rgb = enhance_source_clarity(final_rgb)
         finishing_applied = True
 
@@ -159,7 +166,8 @@ def process_image(
         pixel_clean_applied = True
         finishing_applied = True
     elif layout_mode == "bw":
-        final_rgb = to_black_white_layout(final_rgb)
+        if not bw_variant_applied:
+            final_rgb = to_black_white_layout(final_rgb)
         palette_colors = 2
         pixel_clean_applied = True
     elif layout_mode == "pixel_art":
@@ -205,6 +213,7 @@ def process_image(
         estimated_design_colors=estimated_design_colors,
         design_cropped=design_cropped,
         grid=grid,
+        bw_variant=bw_variant_applied,
     )
 
     result = ProcessingResult(

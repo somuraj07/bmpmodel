@@ -52,6 +52,27 @@ class WeavingParams(BaseModel):
         True,
         description="Use FSRCNN super-resolution when the source is not HD or not sharp.",
     )
+    bw_variant: Optional[str] = Field(
+        None,
+        description="Selected B&W preview variant id (from /bw-preview) applied before BMP layout.",
+    )
+
+
+class BwPreviewVariant(BaseModel):
+    id: str
+    name: str
+    description: str
+    sharpness: float
+    preview_base64: str
+    width: int
+    height: int
+    recommended: bool = False
+
+
+class BwPreviewResponse(BaseModel):
+    variants: list[BwPreviewVariant]
+    source_width: int
+    source_height: int
 
 
 class GridDimensions(BaseModel):
@@ -86,3 +107,4 @@ class ProcessingMetadata(BaseModel):
     estimated_design_colors: int = 0
     design_cropped: bool = False
     grid: Optional[GridDimensions] = None
+    bw_variant: Optional[str] = None

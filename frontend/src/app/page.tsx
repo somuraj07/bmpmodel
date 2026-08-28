@@ -7,13 +7,27 @@ const REEDS_OPTIONS = [50, 52, 54, 56, 58, 60, 64, 66, 68, 70, 72, 78, 80, 90, 9
 const ZOOM_STEPS = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 48, 64];
 
 function resolveApiBaseUrl(): string {
+  // Same-origin proxy in local dev — avoids CORS and direct-port issues.
+  if (typeof window !== "undefined") {
+    const host = window.location.hostname;
+    if (host === "localhost" || host === "127.0.0.1") {
+      return "/api";
+    }
+  }
   const raw = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api").trim().replace(/\/+$/, "");
-  // Accept either https://host or https://host/api — always end with /api
   if (raw.endsWith("/api")) return raw;
   return `${raw}/api`;
 }
 
-const API_BASE_URL = resolveApiBaseUrl();
+function getApiBaseUrl(): string {
+  if (typeof window !== "undefined") {
+    const host = window.location.hostname;
+    if (host === "localhost" || host === "127.0.0.1") {
+      return "/api";
+    }
+  }
+  return resolveApiBaseUrl();
+}
 
 function MinusIcon() {
   return (
@@ -81,6 +95,71 @@ function drawPixelPerfect(
     }
     dctx.stroke();
   }
+}
+
+function ZoomableImage({ src, alt }: { src: string; alt: string }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const sourceCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [zoomIndex, setZoomIndex] = useState(4);
+  const [naturalSize, setNaturalSize] = useState({ w: 0, h: 0 });
+  const zoom = ZOOM_STEPS[zoomIndex];
+
+  const renderZoom = useCallback((scale: number) => {
+    const canvas = canvasRef.current;
+    const source = sourceCanvasRef.current;
+    if (!canvas || !source) return;
+    drawPixelPerfect(canvas, source, scale, false);
+    setNaturalSize({ w: source.width, h: source.height });
+  }, []);
+
+  useEffect(() => {
+    const img = new Image();
+    img.onload = () => {
+      const offscreen = document.createElement("canvas");
+      offscreen.width = img.naturalWidth;
+      offscreen.height = img.naturalHeight;
+      const ctx = offscreen.getContext("2d", { willReadFrequently: true });
+      if (!ctx) return;
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(img, 0, 0);
+      sourceCanvasRef.current = offscreen;
+      const auto = nearestZoomIndex(offscreen.width, offscreen.height);
+      setZoomIndex(auto);
+      renderZoom(ZOOM_STEPS[auto]);
+    };
+    img.src = src;
+  }, [src, renderZoom]);
+
+  useEffect(() => {
+    if (!sourceCanvasRef.current) return;
+    renderZoom(zoom);
+  }, [zoom, renderZoom]);
+
+  return (
+    <div className="pixelPreview">
+      <div className="previewToolbar">
+        <div className="zoomControls">
+          <button type="button" className="zoomBtn" onClick={() => setZoomIndex((i) => Math.max(0, i - 1))} disabled={zoomIndex <= 0} aria-label="Zoom out">
+            <MinusIcon />
+          </button>
+          <span className="zoomLabel">{zoom}×</span>
+          <button type="button" className="zoomBtn" onClick={() => setZoomIndex((i) => Math.min(ZOOM_STEPS.length - 1, i + 1))} disabled={zoomIndex >= ZOOM_STEPS.length - 1} aria-label="Zoom in">
+            <PlusIcon />
+          </button>
+        </div>
+        <button type="button" className="resetZoomBtn" onClick={() => {
+          const s = sourceCanvasRef.current;
+          if (s) setZoomIndex(nearestZoomIndex(s.width, s.height));
+        }}>Fit</button>
+        {naturalSize.w > 0 && (
+          <span className="zoomHint">{naturalSize.w}×{naturalSize.h} px</span>
+        )}
+      </div>
+      <div className="previewScroll previewScrollHd">
+        <canvas ref={canvasRef} className="previewCanvas" />
+      </div>
+    </div>
+  );
 }
 
 function PixelZoomPreview({ src }: { src: string; alt: string }) {
@@ -271,7 +350,38 @@ export default function Home() {
   const [bwVariants, setBwVariants] = useState<BwPreviewVariant[]>([]);
   const [selectedBwVariant, setSelectedBwVariant] = useState<string | null>(null);
   const [bwLoading, setBwLoading] = useState(false);
+  const [activeMenu, setActiveMenu] = useState<"upload" | "bw" | "output" | "weave" | "export">("upload");
+  const [activeViewport, setActiveViewport] = useState<"source" | "bw" | "output">("source");
+  const [backendStatus, setBackendStatus] = useState<"checking" | "connected" | "disconnected">("checking");
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const healthAbortRef = useRef<AbortController | null>(null);
+
+  const checkBackend = useCallback(async () => {
+    healthAbortRef.current?.abort();
+    const controller = new AbortController();
+    healthAbortRef.current = controller;
+    const timeout = setTimeout(() => controller.abort(), 6000);
+    try {
+      const res = await fetch("/api/health", {
+        signal: controller.signal,
+        cache: "no-store",
+      });
+      clearTimeout(timeout);
+      setBackendStatus(res.ok ? "connected" : "disconnected");
+    } catch {
+      clearTimeout(timeout);
+      setBackendStatus("disconnected");
+    }
+  }, []);
+
+  useEffect(() => {
+    checkBackend();
+    const timer = setInterval(checkBackend, 15000);
+    return () => {
+      clearInterval(timer);
+      healthAbortRef.current?.abort();
+    };
+  }, [checkBackend]);
 
   const parseResponseBody = async (res: Response) => {
     const contentType = res.headers.get("content-type") || "";
@@ -317,7 +427,7 @@ export default function Home() {
     try {
       const fd = new FormData();
       fd.append("file", uploaded);
-      const res = await fetch(`${API_BASE_URL}/bw-preview`, { method: "POST", body: fd });
+      const res = await fetch(`${getApiBaseUrl()}/bw-preview`, { method: "POST", body: fd });
       const body = await parseResponseBody(res);
       if (!res.ok) {
         throw new Error(extractErrorMessage(body, "B&W preview failed"));
@@ -373,7 +483,7 @@ export default function Home() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${API_BASE_URL}/convert`, { method: "POST", body: buildFormData() });
+      const res = await fetch(`${getApiBaseUrl()}/convert`, { method: "POST", body: buildFormData() });
       const body = await parseResponseBody(res);
       if (!res.ok) {
         throw new Error(extractErrorMessage(body, "Conversion failed"));
@@ -393,7 +503,7 @@ export default function Home() {
     if (!file) return;
     setLoading(true);
     try {
-      const res = await fetch(`${API_BASE_URL}/convert/download`, { method: "POST", body: buildFormData() });
+      const res = await fetch(`${getApiBaseUrl()}/convert/download`, { method: "POST", body: buildFormData() });
       if (!res.ok) {
         const body = await parseResponseBody(res);
         throw new Error(extractErrorMessage(body, "Download failed"));
@@ -412,348 +522,372 @@ export default function Home() {
     }
   };
 
+  const selectedBw = bwVariants.find((v) => v.id === selectedBwVariant);
+  const menuItems = [
+    { id: "upload" as const, label: "Upload", shortcut: "⌘1" },
+    { id: "bw" as const, label: "B&W", shortcut: "⌘2" },
+    { id: "output" as const, label: "Output", shortcut: "⌘3" },
+    { id: "weave" as const, label: "Weaving", shortcut: "⌘4" },
+    { id: "export" as const, label: "Export", shortcut: "⌘5" },
+  ];
+
   return (
-    <div className="container">
-      <header className="header">
-        <h1>BMP Mode</h1>
-        <p>Convert PNG, JPEG, or any image to production-ready BMP — lossless, grid-aware, without breaking lines.</p>
+    <div className="ideShell">
+      {/* Title bar */}
+      <header className="ideTitlebar">
+        <div className="ideTitlebarLeft">
+          <div className="ideLogo">B</div>
+          <span className="ideAppName">Timelly Studio</span>
+        </div>
+        <button
+          type="button"
+          className={`ideBackendStatus ideBackendStatus--${backendStatus}`}
+          onClick={() => {
+            setBackendStatus("checking");
+            checkBackend();
+          }}
+          title="Click to retry connection"
+        >
+          <span className="ideBackendDot" />
+          <span className="ideBackendText ideBackendText--full">
+            {backendStatus === "checking" && "Connecting…"}
+            {backendStatus === "connected" && "Backend Connected"}
+            {backendStatus === "disconnected" && "Backend Offline — click to retry"}
+          </span>
+          <span className="ideBackendText ideBackendText--short">
+            {backendStatus === "checking" && "…"}
+            {backendStatus === "connected" && "Online"}
+            {backendStatus === "disconnected" && "Offline"}
+          </span>
+        </button>
+        <div className="ideTitlebarRight">
+            <button className="ideTitleBtn ideTitleBtnPrimary" onClick={handleConvert} disabled={!file || loading || (bwPickerEnabled && !selectedBwVariant)}>
+            <span className="ideBtnTextFull">{loading ? "Processing…" : "Convert"}</span>
+            <span className="ideBtnTextShort">{loading ? "…" : "Go"}</span>
+          </button>
+          {result && (
+            <button className="ideTitleBtn" onClick={handleDownload} disabled={loading}>
+              <span className="ideBtnTextFull">Download BMP</span>
+              <span className="ideBtnTextShort">Save</span>
+            </button>
+          )}
+        </div>
       </header>
 
-      <main className="main">
-        <section className="panel">
-          <h2>1. Upload Design</h2>
-          <div
-            className="dropzone"
-            onClick={() => fileInputRef.current?.click()}
-            onDragOver={(e) => e.preventDefault()}
-            onDrop={(e) => {
-              e.preventDefault();
-              const dropped = e.dataTransfer.files[0];
-              if (dropped) {
-                setFile(dropped);
-                setPreviewUrl(URL.createObjectURL(dropped));
-                setResult(null);
-                setError(null);
-                setBwVariants([]);
-                setSelectedBwVariant(null);
-              }
-            }}
+      {/* Menu bar */}
+      <nav className="ideMenubar">
+        {menuItems.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            className={`ideMenuItem ${activeMenu === item.id ? "ideMenuItemActive" : ""}`}
+            onClick={() => setActiveMenu(item.id)}
           >
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="image/*"
-              onChange={handleFileChange}
-              hidden
-            />
-            {file ? (
-              <div className="fileInfo">
-                <span className="fileName">{file.name}</span>
-                <span className="fileMeta">{(file.size / 1024).toFixed(1)} KB</span>
-              </div>
-            ) : (
-              <p>Drop image here or click to browse<br /><span>PNG, JPEG, BMP, GIF, TIFF, WebP</span></p>
-            )}
+            {item.label}
+            <span className="ideMenuShortcut">{item.shortcut}</span>
+          </button>
+        ))}
+      </nav>
+
+      {error && (
+        <div className="ideErrorBanner">{error}</div>
+      )}
+
+      {/* Editor body */}
+      <div className="ideBody">
+        {/* Left settings panel */}
+        <aside className="ideSidebar">
+          <div className="ideSidebarHeader">
+            <span className="ideSidebarTitle">{menuItems.find((m) => m.id === activeMenu)?.label}</span>
+            <span className="ideSidebarSubtitle">Settings</span>
           </div>
-        </section>
+          <div className="ideSidebarContent">
 
-        <section className="panel">
-          <h2>2. Black &amp; White Picker</h2>
-          <label className="toggle">
-            <input
-              type="checkbox"
-              checked={bwPickerEnabled}
-              onChange={(e) => {
-                setBwPickerEnabled(e.target.checked);
-                setResult(null);
-              }}
-            />
-            Compare B&amp;W clarity options first (7 variants — pick the clearest, then convert to BMP)
-          </label>
-          {bwPickerEnabled && (
-            <>
-              <p className="hint" style={{ marginTop: "0.5rem" }}>
-                Upload a design, choose the sharpest black &amp; white version, then convert to BMP below.
-              </p>
-              {!file && <p className="hint">Upload an image to generate B&amp;W options.</p>}
-              {file && bwLoading && <p className="hint">Generating 7 B&amp;W clarity options…</p>}
-              {file && !bwLoading && bwVariants.length > 0 && (
-                <>
-                  <p className="bwPickerHint">Click one image to select it — highlighted card will be used for BMP conversion.</p>
-                  <div className="bwPickerGrid" role="listbox" aria-label="Black and white clarity options">
-                    {bwVariants.map((variant) => {
-                      const isSelected = selectedBwVariant === variant.id;
-                      return (
-                        <button
-                          key={variant.id}
-                          type="button"
-                          role="option"
-                          aria-selected={isSelected}
-                          className={`bwOption ${isSelected ? "bwOptionSelected" : ""}`}
-                          onClick={() => {
-                            setSelectedBwVariant(variant.id);
-                            setResult(null);
-                          }}
-                        >
-                          <div className="bwOptionFrame">
-                            <img
-                              src={`data:image/png;base64,${variant.preview_base64}`}
-                              alt={variant.name}
-                              className="bwOptionImg"
-                            />
-                            {isSelected && (
-                              <span className="bwSelectedMark" aria-hidden="true">
-                                ✓
-                              </span>
-                            )}
-                          </div>
-                          <div className="bwOptionTitle">{variant.name}</div>
-                          <div className="bwOptionMeta">Clarity: {variant.sharpness.toFixed(0)}</div>
-                          {isSelected && <span className="bwSelectedLabel">Selected</span>}
-                          {!isSelected && variant.recommended && (
-                            <span className="bwBadge">Best clarity</span>
-                          )}
-                        </button>
-                      );
-                    })}
-                  </div>
-                  <div className="bwPickerActions">
-                    <button
-                      type="button"
-                      className="secondaryBtn"
-                      onClick={() => file && fetchBwPreviews(file)}
-                      disabled={!file || bwLoading}
-                    >
-                      Regenerate options
-                    </button>
-                    {selectedBwVariant && (
-                      <span className="bwSelectedSummary">
-                        Ready to convert:{" "}
-                        <strong>{bwVariants.find((v) => v.id === selectedBwVariant)?.name}</strong>
-                      </span>
-                    )}
-                  </div>
-                </>
-              )}
-            </>
-          )}
-        </section>
-
-        <section className="panel">
-          <h2>3. Output Quality</h2>
-          <div className="params">
-            <div className="field layoutModeField">
-              <label>Layout mode</label>
-              <select value={layoutMode} onChange={(e) => setLayoutMode(e.target.value as "color" | "bw" | "pixel_art" | "saree_print")}>
-                <option value="saree_print">Saree machine print (indexed BMP)</option>
-                <option value="pixel_art">Pixel Art layout</option>
-                <option value="color">Color photo BMP</option>
-                <option value="bw">Black &amp; White layout</option>
-              </select>
-              {layoutMode === "saree_print" && (
-                <>
-                  <p className="hint">Chunky mill pixels: solid inks, hard squares, no blur — like the left reference. Use 4× blocks.</p>
-                  <div className="field" style={{ marginTop: "8px" }}>
-                    <label>Pixel block size</label>
-                    <select value={blockStrength} onChange={(e) => setBlockStrength(e.target.value as "soft" | "medium" | "hard" | "extreme")}>
-                      <option value="soft">2× squares</option>
-                      <option value="medium">3× squares</option>
-                      <option value="hard">4× squares (recommended)</option>
-                      <option value="extreme">6× squares</option>
-                    </select>
-                  </div>
-                </>
-              )}
-              {layoutMode === "bw" && (
-                <p className="hint">Best for sharp pixels — outputs strict black/white only.</p>
-              )}
-              {layoutMode === "pixel_art" && (
-                <>
-                  <p className="hint">Matches production BMPs: 8–16 solid weaving colors, hard pixel blocks.</p>
-                  <div className="field" style={{ marginTop: "8px" }}>
-                    <label>Pixel Block Strength</label>
-                    <select value={blockStrength} onChange={(e) => setBlockStrength(e.target.value as "soft" | "medium" | "hard" | "extreme")}>
-                      <option value="soft">Soft (fine detail, small blocks)</option>
-                      <option value="medium">Medium</option>
-                      <option value="hard">Hard (recommended — large solid blocks)</option>
-                      <option value="extreme">Extreme (biggest blocks, max clarity)</option>
-                    </select>
-                  </div>
-                </>
-              )}
-            </div>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={mlClarity}
-                onChange={(e) => setMlClarity(e.target.checked)}
-              />
-              ML clarity recovery (FSRCNN — if original is not HD / not sharp)
-            </label>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={hdOutput}
-                onChange={(e) => setHdOutput(e.target.checked)}
-              />
-              HD pixel output (auto upscale, sharp pixels)
-            </label>
-            {hdOutput && (
-              <div className="field">
-                <label>HD target (longest side px)</label>
-                <select value={hdMinLongest} onChange={(e) => setHdMinLongest(Number(e.target.value))}>
-                  <option value={1280}>1280 px</option>
-                  <option value={1920}>1920 px (Full HD)</option>
-                  <option value={2560}>2560 px (2K)</option>
-                  <option value={3840}>3840 px (4K)</option>
-                </select>
-              </div>
-            )}
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={pixelClean}
-                onChange={(e) => setPixelClean(e.target.checked)}
-                disabled={layoutMode === "bw" || layoutMode === "pixel_art" || layoutMode === "saree_print"}
-              />
-              Full pixel color clarity (solid colors, no mixed pixels)
-            </label>
-            {pixelClean && layoutMode !== "bw" && layoutMode !== "pixel_art" && layoutMode !== "saree_print" && (
-              <div className="field">
-                <label>Max solid colors</label>
-                <select value={maxColors} onChange={(e) => setMaxColors(Number(e.target.value))}>
-                  <option value={8}>8 colors</option>
-                  <option value={16}>16 colors</option>
-                  <option value={32}>32 colors</option>
-                  <option value={64}>64 colors (recommended)</option>
-                  <option value={128}>128 colors</option>
-                </select>
-              </div>
-            )}
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={autoSize}
-                onChange={(e) => setAutoSize(e.target.checked)}
-              />
-              Auto-size to original dimensions (before HD upscale)
-            </label>
-          </div>
-        </section>
-
-        <section className="panel">
-          <h2>4. Weaving Parameters</h2>
-          <label className="toggle">
-            <input type="checkbox" checked={useGrid} onChange={(e) => setUseGrid(e.target.checked)} />
-            Apply weaving grid mapping (Hooks × Reeds)
-          </label>
-
-          {useGrid && (
-            <div className="params">
-              <div className="field">
-                <label>Hooks</label>
-                <select value={hooks} onChange={(e) => setHooks(Number(e.target.value))}>
-                  {HOOKS_OPTIONS.map((v) => (
-                    <option key={v} value={v}>{v}</option>
-                  ))}
-                </select>
-              </div>
-              <div className="field">
-                <label>Reeds</label>
-                <select value={reeds} onChange={(e) => setReeds(Number(e.target.value))}>
-                  {REEDS_OPTIONS.map((v) => (
-                    <option key={v} value={v}>{v}</option>
-                  ))}
-                </select>
-              </div>
-              <div className="field">
-                <label>Shuttle / Pick</label>
-                <select value={shuttle} onChange={(e) => setShuttle(Number(e.target.value))}>
-                  {[1, 2, 3, 4, 5].map((v) => (
-                    <option key={v} value={v}>{v}</option>
-                  ))}
-                </select>
-              </div>
-              <label className="toggle">
-                <input
-                  type="checkbox"
-                  checked={enableCorrection}
-                  onChange={(e) => setEnableCorrection(e.target.checked)}
-                />
-                Auto-correct broken lines &amp; gaps
-              </label>
-              <div className="ratio">
-                Ratio: {(hooks / reeds).toFixed(3)} (Hooks ÷ Reeds)
-              </div>
-            </div>
-          )}
-
-          {!useGrid && (
-            <p className="hint">
-              Direct mode: lossless BMP with HD pixel upscaling and sharp edges by default.
-            </p>
-          )}
-        </section>
-
-        <section className="panel">
-          <h2>5. Convert &amp; Download</h2>
-          <div className="actions">
-            <button
-              className="primaryBtn"
-              onClick={handleConvert}
-              disabled={!file || loading || (bwPickerEnabled && !selectedBwVariant)}
-            >
-              {loading ? "Processing…" : bwPickerEnabled ? "Convert selected B&W to BMP" : "Convert to BMP"}
-            </button>
-            {result && (
-              <button className="secondaryBtn" onClick={handleDownload} disabled={loading}>
-                Download BMP
-              </button>
-            )}
-          </div>
-          {error && <p className="error">{error}</p>}
-        </section>
-
-        <section className="previewSection">
-          <div className="previewCol">
-            <h3>Original</h3>
-            {previewUrl ? (
-              <img src={previewUrl} alt="Original" className="previewImg" />
-            ) : (
-              <div className="placeholder">No image uploaded</div>
-            )}
-          </div>
-          <div className="previewCol">
-            <h3>BMP Output Preview</h3>
-            {result ? (
-              <>
-                <PixelZoomPreview
-                  src={`data:image/png;base64,${result.preview_base64}`}
-                  alt="BMP preview"
-                />
-                <div className="meta">
-                  <div><strong>Output:</strong> {result.metadata.output_width} × {result.metadata.output_height} px</div>
-                  <div><strong>Bit depth:</strong> {result.metadata.bit_depth}-bit</div>
-                  <div><strong>Grid applied:</strong> {result.metadata.grid_applied ? "Yes" : "No"}</div>
-                  <div><strong>Correction:</strong> {result.metadata.correction_applied ? "Yes" : "No"}</div>
-                  <div><strong>Auto-size:</strong> {result.metadata.auto_sized ? "Yes" : "No"}</div>
-                  <div><strong>HD upscale:</strong> {result.metadata.hd_applied ? `${result.metadata.hd_scale}×` : "No (already HD)"}</div>
-                  <div><strong>Layout mode:</strong> {result.metadata.layout_mode === "bw" ? "Black & White" : result.metadata.layout_mode === "pixel_art" ? "Pixel Art" : result.metadata.layout_mode === "saree_print" ? "Saree machine print" : "Color"}</div>
-                  {result.metadata.bw_variant && (
-                    <div><strong>B&amp;W variant:</strong> {bwVariants.find((v) => v.id === result.metadata.bw_variant)?.name ?? result.metadata.bw_variant}</div>
+            {activeMenu === "upload" && (
+              <div className="idePanel">
+                <div
+                  className="dropzone"
+                  onClick={() => fileInputRef.current?.click()}
+                  onDragOver={(e) => e.preventDefault()}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    const dropped = e.dataTransfer.files[0];
+                    if (dropped) {
+                      setFile(dropped);
+                      setPreviewUrl(URL.createObjectURL(dropped));
+                      setResult(null);
+                      setError(null);
+                      setBwVariants([]);
+                      setSelectedBwVariant(null);
+                    }
+                  }}
+                >
+                  <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFileChange} hidden />
+                  {file ? (
+                    <div className="fileInfo">
+                      <span className="fileName">{file.name}</span>
+                      <span className="fileMeta">{(file.size / 1024).toFixed(1)} KB</span>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="dropzoneIcon">
+                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M12 16V4m0 0L8 8m4-4 4 4M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                      </div>
+                      <p>Drop or click to upload<br /><span>PNG, JPEG, BMP, WebP…</span></p>
+                    </>
                   )}
-                  <div><strong>Pixel color clarity:</strong> {result.metadata.pixel_clean_applied ? `Yes (${result.metadata.palette_colors} solid colors)` : "No"}</div>
-                  <div><strong>ML clarity:</strong> {result.metadata.ml_applied ? `Yes (FSRCNN ${result.metadata.ml_scale}×)` : "No"}</div>
-                  <div><strong>Raw photo analysis:</strong> {result.metadata.is_raw_photo ? `Yes → ${result.metadata.estimated_design_colors} design colors${result.metadata.design_cropped ? ", cropped" : ""}` : "No (already a design)"}</div>
-                  <div><strong>BMP size:</strong> {(result.bmp_size_bytes / 1024).toFixed(1)} KB</div>
                 </div>
-              </>
-            ) : (
-              <div className="placeholder">Convert to see preview</div>
+              </div>
+            )}
+
+            {activeMenu === "bw" && (
+              <div className="idePanel">
+                <label className="toggle">
+                  <input type="checkbox" checked={bwPickerEnabled} onChange={(e) => { setBwPickerEnabled(e.target.checked); setResult(null); }} />
+                  <span className="toggleSwitch" />
+                  <span className="toggleLabel"><strong>B&amp;W picker</strong>Generate 7 clarity variants</span>
+                </label>
+                {bwPickerEnabled && file && bwLoading && (
+                  <div className="loadingPulse"><div className="loadingDots"><span /><span /><span /></div>Generating…</div>
+                )}
+                {bwPickerEnabled && !file && <p className="hint">Upload an image first.</p>}
+                {bwPickerEnabled && file && !bwLoading && (
+                  <button type="button" className="secondaryBtn" style={{ width: "100%", marginTop: "0.5rem" }} onClick={() => file && fetchBwPreviews(file)} disabled={bwLoading}>
+                    Regenerate variants
+                  </button>
+                )}
+              </div>
+            )}
+
+            {activeMenu === "output" && (
+              <div className="idePanel">
+                <div className="params">
+                  <div className="field layoutModeField">
+                    <label>Layout mode</label>
+                    <select value={layoutMode} onChange={(e) => setLayoutMode(e.target.value as "color" | "bw" | "pixel_art" | "saree_print")}>
+                      <option value="saree_print">Saree machine print</option>
+                      <option value="pixel_art">Pixel Art</option>
+                      <option value="color">Color photo</option>
+                      <option value="bw">Black &amp; White</option>
+                    </select>
+                  </div>
+                  {(layoutMode === "saree_print" || layoutMode === "pixel_art") && (
+                    <div className="field">
+                      <label>Block strength</label>
+                      <select value={blockStrength} onChange={(e) => setBlockStrength(e.target.value as "soft" | "medium" | "hard" | "extreme")}>
+                        <option value="soft">Soft 2×</option>
+                        <option value="medium">Medium 3×</option>
+                        <option value="hard">Hard 4×</option>
+                        <option value="extreme">Extreme 6×</option>
+                      </select>
+                    </div>
+                  )}
+                  <label className="toggle">
+                    <input type="checkbox" checked={mlClarity} onChange={(e) => setMlClarity(e.target.checked)} />
+                    <span className="toggleSwitch" />
+                    <span className="toggleLabel"><strong>ML clarity</strong>FSRCNN recovery</span>
+                  </label>
+                  <label className="toggle">
+                    <input type="checkbox" checked={hdOutput} onChange={(e) => setHdOutput(e.target.checked)} />
+                    <span className="toggleSwitch" />
+                    <span className="toggleLabel"><strong>HD output</strong>Auto upscale</span>
+                  </label>
+                  {hdOutput && (
+                    <div className="field">
+                      <label>HD target</label>
+                      <select value={hdMinLongest} onChange={(e) => setHdMinLongest(Number(e.target.value))}>
+                        <option value={1280}>1280 px</option>
+                        <option value={1920}>1920 px</option>
+                        <option value={2560}>2560 px</option>
+                        <option value={3840}>3840 px</option>
+                      </select>
+                    </div>
+                  )}
+                  <label className="toggle">
+                    <input type="checkbox" checked={pixelClean} onChange={(e) => setPixelClean(e.target.checked)} disabled={layoutMode === "bw" || layoutMode === "pixel_art" || layoutMode === "saree_print"} />
+                    <span className="toggleSwitch" />
+                    <span className="toggleLabel"><strong>Pixel clarity</strong>Solid colors</span>
+                  </label>
+                  {pixelClean && layoutMode !== "bw" && layoutMode !== "pixel_art" && layoutMode !== "saree_print" && (
+                    <div className="field">
+                      <label>Max colors</label>
+                      <select value={maxColors} onChange={(e) => setMaxColors(Number(e.target.value))}>
+                        <option value={8}>8</option><option value={16}>16</option>
+                        <option value={32}>32</option><option value={64}>64</option><option value={128}>128</option>
+                      </select>
+                    </div>
+                  )}
+                  <label className="toggle">
+                    <input type="checkbox" checked={autoSize} onChange={(e) => setAutoSize(e.target.checked)} />
+                    <span className="toggleSwitch" />
+                    <span className="toggleLabel"><strong>Auto-size</strong>Match source dims</span>
+                  </label>
+                </div>
+              </div>
+            )}
+
+            {activeMenu === "weave" && (
+              <div className="idePanel">
+                <label className="toggle">
+                  <input type="checkbox" checked={useGrid} onChange={(e) => setUseGrid(e.target.checked)} />
+                  <span className="toggleSwitch" />
+                  <span className="toggleLabel"><strong>Weaving grid</strong>Hooks × Reeds</span>
+                </label>
+                {useGrid && (
+                  <div className="params">
+                    <div className="field"><label>Hooks</label>
+                      <select value={hooks} onChange={(e) => setHooks(Number(e.target.value))}>{HOOKS_OPTIONS.map((v) => <option key={v} value={v}>{v}</option>)}</select>
+                    </div>
+                    <div className="field"><label>Reeds</label>
+                      <select value={reeds} onChange={(e) => setReeds(Number(e.target.value))}>{REEDS_OPTIONS.map((v) => <option key={v} value={v}>{v}</option>)}</select>
+                    </div>
+                    <div className="field"><label>Shuttle</label>
+                      <select value={shuttle} onChange={(e) => setShuttle(Number(e.target.value))}>{[1,2,3,4,5].map((v) => <option key={v} value={v}>{v}</option>)}</select>
+                    </div>
+                    <label className="toggle">
+                      <input type="checkbox" checked={enableCorrection} onChange={(e) => setEnableCorrection(e.target.checked)} />
+                      <span className="toggleSwitch" />
+                      <span className="toggleLabel"><strong>Auto-correct</strong>Fix broken lines</span>
+                    </label>
+                    <div className="ratio">Ratio: {(hooks / reeds).toFixed(3)}</div>
+                  </div>
+                )}
+                {!useGrid && <p className="hint">Direct mode — no grid mapping.</p>}
+              </div>
+            )}
+
+            {activeMenu === "export" && (
+              <div className="idePanel">
+                <p className="hint" style={{ marginBottom: "1rem" }}>Convert your selected B&amp;W variant to a production BMP file.</p>
+                <button className="primaryBtn" style={{ width: "100%" }} onClick={handleConvert} disabled={!file || loading || (bwPickerEnabled && !selectedBwVariant)}>
+                  {loading ? "Processing…" : "Convert to BMP"}
+                </button>
+                {result && (
+                  <button className="secondaryBtn" style={{ width: "100%", marginTop: "0.5rem" }} onClick={handleDownload} disabled={loading}>
+                    Download BMP
+                  </button>
+                )}
+                {error && <p className="error">{error}</p>}
+              </div>
+            )}
+
+          </div>
+        </aside>
+
+        {/* Center canvas */}
+        <main className="ideCanvas">
+          {/* Viewport tabs */}
+          <div className="ideViewportTabs">
+            <button type="button" className={`ideViewportTab ${activeViewport === "source" ? "ideViewportTabActive" : ""}`} onClick={() => setActiveViewport("source")}>
+              Source
+            </button>
+            <button type="button" className={`ideViewportTab ${activeViewport === "bw" ? "ideViewportTabActive" : ""}`} onClick={() => setActiveViewport("bw")} disabled={!bwPickerEnabled || !selectedBw}>
+              <span className="ideTabTextFull">B&amp;W Selected</span>
+              <span className="ideTabTextShort">B&amp;W</span>
+            </button>
+            <button type="button" className={`ideViewportTab ${activeViewport === "output" ? "ideViewportTabActive" : ""}`} onClick={() => setActiveViewport("output")} disabled={!result}>
+              <span className="ideTabTextFull">BMP Output</span>
+              <span className="ideTabTextShort">Output</span>
+            </button>
+          </div>
+
+          {/* Canvas area */}
+          <div className="ideCanvasArea">
+            {activeViewport === "source" && (
+              previewUrl ? (
+                <ZoomableImage src={previewUrl} alt="Source" />
+              ) : (
+                <div className="ideCanvasEmpty">
+                  <div className="ideCanvasEmptyIcon">⊞</div>
+                  <p>No source image</p>
+                  <button className="secondaryBtn" onClick={() => { setActiveMenu("upload"); fileInputRef.current?.click(); }}>Upload design</button>
+                </div>
+              )
+            )}
+
+            {activeViewport === "bw" && selectedBw && (
+              <ZoomableImage src={`data:image/png;base64,${selectedBw.preview_base64}`} alt={selectedBw.name} />
+            )}
+
+            {activeViewport === "bw" && !selectedBw && (
+              <div className="ideCanvasEmpty"><p>Select a B&amp;W variant below</p></div>
+            )}
+
+            {activeViewport === "output" && result && (
+              <PixelZoomPreview src={`data:image/png;base64,${result.preview_base64}`} alt="BMP output" />
+            )}
+
+            {activeViewport === "output" && !result && (
+              <div className="ideCanvasEmpty"><p>Convert to see BMP output</p></div>
             )}
           </div>
-        </section>
-      </main>
+
+          {/* B&W thumbnail strip */}
+          {bwPickerEnabled && bwVariants.length > 0 && (
+            <div className="ideBwStrip">
+              <div className="ideBwStripLabel">B&amp;W Variants — click to select</div>
+              <div className="bwPickerGrid" role="listbox">
+                {bwVariants.map((variant) => {
+                  const isSelected = selectedBwVariant === variant.id;
+                  return (
+                    <button
+                      key={variant.id}
+                      type="button"
+                      role="option"
+                      aria-selected={isSelected}
+                      className={`bwOption ${isSelected ? "bwOptionSelected" : ""}`}
+                      onClick={() => { setSelectedBwVariant(variant.id); setActiveViewport("bw"); setResult(null); }}
+                    >
+                      <div className="bwOptionFrame">
+                        <img src={`data:image/png;base64,${variant.preview_base64}`} alt={variant.name} className="bwOptionImg" />
+                        {isSelected && <span className="bwSelectedMark">✓</span>}
+                      </div>
+                      <div className="bwOptionTitle">{variant.name}</div>
+                      <div className="bwOptionMeta">{variant.sharpness.toFixed(0)}</div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </main>
+
+        {/* Right properties panel */}
+        <aside className="ideProps">
+          <div className="ideSidebarHeader">
+            <span className="ideSidebarTitle">Properties</span>
+          </div>
+          <div className="idePropsContent">
+            <div className="meta">
+              <div><strong>File</strong><span>{file?.name ?? "—"}</span></div>
+              <div><strong>B&amp;W</strong><span>{selectedBw?.name ?? "—"}</span></div>
+              <div><strong>Layout</strong><span>{layoutMode.replace("_", " ")}</span></div>
+              <div><strong>Grid</strong><span>{useGrid ? `${hooks}×${reeds}` : "Off"}</span></div>
+              {result && (
+                <>
+                  <div><strong>Output</strong><span>{result.metadata.output_width}×{result.metadata.output_height}</span></div>
+                  <div><strong>Colors</strong><span>{result.metadata.palette_colors}</span></div>
+                  <div><strong>Size</strong><span>{(result.bmp_size_bytes / 1024).toFixed(1)} KB</span></div>
+                </>
+              )}
+            </div>
+          </div>
+        </aside>
+      </div>
+
+      {/* Status bar */}
+      <footer className="ideStatusbar">
+        <span className={`ideStatusItem ideStatusItem--${backendStatus}`}>
+          <span className="ideBackendDot" />
+          <span className="ideStatusText">{backendStatus === "connected" ? "Online" : backendStatus === "disconnected" ? "Offline" : "…"}</span>
+        </span>
+        <span className="ideStatusSep">|</span>
+        <span className="ideStatusItem ideStatusItem--file">{file ? file.name : "No file"}</span>
+        <span className="ideStatusSep ideStatusSep--mid">|</span>
+        <span className="ideStatusItem ideStatusItem--bw">{selectedBw ? selectedBw.name : "No B&W"}</span>
+        <span className="ideStatusSep ideStatusSep--mid">|</span>
+        <span className="ideStatusItem">{result ? "Ready" : "Pending"}</span>
+      </footer>
     </div>
   );
 }

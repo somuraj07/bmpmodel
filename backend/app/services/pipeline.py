@@ -23,6 +23,7 @@ from app.services.ml_clarity import enhance_with_ml
 from app.services.pixel_cleaner import clean_pixels, quantize_to_solid_pixels
 from app.services.saree_print import to_saree_print_layout
 from app.services.bw_preview import apply_bw_variant
+from app.services.weaving_calculator import calculate_grid
 
 
 @dataclass

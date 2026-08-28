@@ -115,7 +115,8 @@ input, select { font-family: inherit; }
 
 .ideBackendStatus--connected { color: var(--success); border-color: rgba(62, 207, 142, 0.3); background: var(--success-soft); }
 .ideBackendStatus--disconnected { color: var(--error); border-color: rgba(255, 107, 107, 0.3); background: var(--error-soft); }
-.ideBackendStatus--checking { color: var(--warning); }
+.ideBackendStatus--checking,
+.ideBackendStatus--warming { color: var(--warning); }
 
 .ideBackendDot {
   width: 7px;

@@ -29,6 +29,21 @@ function getApiBaseUrl(): string {
   return resolveApiBaseUrl();
 }
 
+function getHealthUrls(): string[] {
+  if (typeof window !== "undefined") {
+    const host = window.location.hostname;
+    if (host === "localhost" || host === "127.0.0.1") {
+      return [
+        "http://127.0.0.1:8000/api/health",
+        "/api/health",
+      ];
+    }
+  }
+
+  const base = getApiBaseUrl().replace(/\/+$/, "");
+  return [`${base}/health`];
+}
+
 function MinusIcon() {
   return (
     <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
@@ -352,36 +367,52 @@ export default function Home() {
   const [bwLoading, setBwLoading] = useState(false);
   const [activeMenu, setActiveMenu] = useState<"upload" | "bw" | "output" | "weave" | "export">("upload");
   const [activeViewport, setActiveViewport] = useState<"source" | "bw" | "output">("source");
-  const [backendStatus, setBackendStatus] = useState<"checking" | "connected" | "disconnected">("checking");
+  const [backendStatus, setBackendStatus] = useState<"checking" | "warming" | "connected" | "disconnected">("checking");
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const healthAbortRef = useRef<AbortController | null>(null);
 
-  const checkBackend = useCallback(async () => {
-    healthAbortRef.current?.abort();
-    const controller = new AbortController();
-    healthAbortRef.current = controller;
-    const timeout = setTimeout(() => controller.abort(), 6000);
-    try {
-      const res = await fetch("/api/health", {
-        signal: controller.signal,
-        cache: "no-store",
-      });
-      clearTimeout(timeout);
-      setBackendStatus(res.ok ? "connected" : "disconnected");
-    } catch {
-      clearTimeout(timeout);
-      setBackendStatus("disconnected");
+  const checkBackendHealth = useCallback(async () => {
+    for (const url of getHealthUrls()) {
+      try {
+        const res = await fetch(url, { cache: "no-store" });
+        if (!res.ok) continue;
+        const data = await res.json().catch(() => null);
+        if (data?.status === "ok") {
+          setBackendStatus("connected");
+          return true;
+        }
+      } catch {
+        // Try the next URL.
+      }
     }
+    return false;
   }, []);
 
   useEffect(() => {
-    checkBackend();
-    const timer = setInterval(checkBackend, 15000);
-    return () => {
-      clearInterval(timer);
-      healthAbortRef.current?.abort();
+    let mounted = true;
+
+    const connect = async () => {
+      if (await checkBackendHealth()) return;
+
+      for (let attempt = 1; attempt <= 8 && mounted; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        if (!mounted) return;
+        setBackendStatus("warming");
+        if (await checkBackendHealth()) return;
+      }
+
+      if (mounted) setBackendStatus("disconnected");
     };
-  }, [checkBackend]);
+
+    void connect();
+    const timer = setInterval(() => {
+      void checkBackendHealth();
+    }, 30000);
+
+    return () => {
+      mounted = false;
+      clearInterval(timer);
+    };
+  }, [checkBackendHealth]);
 
   const parseResponseBody = async (res: Response) => {
     const contentType = res.headers.get("content-type") || "";
@@ -544,18 +575,24 @@ export default function Home() {
           className={`ideBackendStatus ideBackendStatus--${backendStatus}`}
           onClick={() => {
             setBackendStatus("checking");
-            checkBackend();
+            void (async () => {
+              if (!(await checkBackendHealth())) {
+                setBackendStatus("disconnected");
+              }
+            })();
           }}
           title="Click to retry connection"
         >
           <span className="ideBackendDot" />
           <span className="ideBackendText ideBackendText--full">
             {backendStatus === "checking" && "Connecting…"}
+            {backendStatus === "warming" && "Waking up server…"}
             {backendStatus === "connected" && "Backend Connected"}
             {backendStatus === "disconnected" && "Backend Offline — click to retry"}
           </span>
           <span className="ideBackendText ideBackendText--short">
             {backendStatus === "checking" && "…"}
+            {backendStatus === "warming" && "…"}
             {backendStatus === "connected" && "Online"}
             {backendStatus === "disconnected" && "Offline"}
           </span>
@@ -879,7 +916,15 @@ export default function Home() {
       <footer className="ideStatusbar">
         <span className={`ideStatusItem ideStatusItem--${backendStatus}`}>
           <span className="ideBackendDot" />
-          <span className="ideStatusText">{backendStatus === "connected" ? "Online" : backendStatus === "disconnected" ? "Offline" : "…"}</span>
+          <span className="ideStatusText">
+            {backendStatus === "connected"
+              ? "Online"
+              : backendStatus === "disconnected"
+                ? "Offline"
+                : backendStatus === "warming"
+                  ? "Waking up"
+                  : "…"}
+          </span>
         </span>
         <span className="ideStatusSep">|</span>
         <span className="ideStatusItem ideStatusItem--file">{file ? file.name : "No file"}</span>

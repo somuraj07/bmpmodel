@@ -3,6 +3,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+from app.services.pixel_cleaner import quantize_to_solid_pixels
+
 
 def _to_lab(rgb: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
@@ -84,6 +86,7 @@ def _agglomerative_merge(
     max_dl: float,
     same_hue_de: float,
     same_hue_dl: float,
+    min_colors: int = 2,
 ) -> np.ndarray:
     pal = [c.copy() for c in centers]
     n = len(pal)
@@ -98,6 +101,8 @@ def _agglomerative_merge(
 
     while True:
         roots = sorted({find(i) for i in range(n) if counts[find(i)] > 0})
+        if len(roots) <= max(2, int(min_colors)):
+            break
         best = None
         for ai, a in enumerate(roots):
             for b in roots[ai + 1 :]:
@@ -208,6 +213,113 @@ def _flatten_palette_rgb(palette_rgb: np.ndarray, rgb: np.ndarray) -> np.ndarray
     elif val_mean >= 130 and sat_mean <= 80 and int(light.min()) >= 200 and spread <= 40:
         out[light_i] = [255, 255, 255]
     return out
+
+
+def _edge_mask(rgb: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 60, 140)
+    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    edges = cv2.dilate(edges, kernel, iterations=1)
+    return edges > 0
+
+
+def _outline_mask(rgb: np.ndarray) -> np.ndarray:
+    """Very dark linework only — not broad Canny edges."""
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    lab = _to_lab(rgb)
+    return (lab[:, :, 0] < 40) & (gray < 90)
+
+
+def _snap_denoise(rgb: np.ndarray, step: int = 8) -> np.ndarray:
+    return ((rgb.astype(np.uint16) + step // 2) // step * step).clip(0, 255).astype(np.uint8)
+
+
+def _lock_outline_ink(
+    labels: np.ndarray, palette_lab: np.ndarray, outline_mask: np.ndarray
+) -> np.ndarray:
+    if not np.any(outline_mask):
+        return labels
+    dark_i = int(np.argmin(palette_lab[:, 0]))
+    out = labels.copy()
+    out[outline_mask] = dark_i
+    return out
+
+
+def _smooth_fill_labels(
+    labels: np.ndarray, protected: np.ndarray, passes: int = 2
+) -> np.ndarray:
+    """Smooth noisy fill only — never bleed color across outlines."""
+    h, w = labels.shape
+    n_labels = int(labels.max()) + 1
+    for _ in range(passes):
+        padded = np.pad(labels, 1, mode="edge")
+        neighbours = np.empty((h, w, 9), dtype=np.int32)
+        idx = 0
+        for dy in range(3):
+            for dx in range(3):
+                neighbours[:, :, idx] = padded[dy : dy + h, dx : dx + w]
+                idx += 1
+        same_count = np.sum(neighbours == labels[:, :, None], axis=2)
+        update_mask = (same_count <= 3) & (~protected)
+        if not np.any(update_mask):
+            break
+        votes = np.zeros((h, w, n_labels), dtype=np.int32)
+        rows = np.arange(h)[:, None]
+        cols = np.arange(w)[None, :]
+        for i in range(9):
+            np.add.at(votes, (rows, cols, neighbours[:, :, i]), 1)
+        majority = np.argmax(votes, axis=2).astype(np.int32)
+        labels = np.where(update_mask, majority, labels)
+    return labels
+
+
+def _remove_fringe_labels(labels: np.ndarray, protected: np.ndarray) -> np.ndarray:
+    """Remove anti-alias fringe pixels that cause color overlap at borders."""
+    h, w = labels.shape
+    rows = np.arange(h)[:, None]
+    cols = np.arange(w)[None, :]
+
+    def _neighbour_majority(lbl: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        up = np.roll(lbl, -1, axis=0)
+        dn = np.roll(lbl, 1, axis=0)
+        lt = np.roll(lbl, 1, axis=1)
+        rt = np.roll(lbl, -1, axis=1)
+        neighbours = np.stack([up, dn, lt, rt], axis=2)
+        same = (
+            (up == lbl).astype(np.int32)
+            + (dn == lbl).astype(np.int32)
+            + (lt == lbl).astype(np.int32)
+            + (rt == lbl).astype(np.int32)
+        )
+        n = int(lbl.max()) + 1
+        votes = np.zeros((h, w, n), dtype=np.int32)
+        for i in range(4):
+            np.add.at(votes, (rows, cols, neighbours[:, :, i]), 1)
+        return same, np.argmax(votes, axis=2).astype(np.int32)
+
+    for _ in range(6):
+        same, majority = _neighbour_majority(labels)
+        mask = (same == 0) & (~protected)
+        if not np.any(mask):
+            break
+        labels = np.where(mask, majority, labels)
+    for _ in range(3):
+        same, majority = _neighbour_majority(labels)
+        mask = (same <= 1) & (~protected)
+        if not np.any(mask):
+            break
+        labels = np.where(mask, majority, labels)
+    return labels
+
+
+def _estimate_ink_count(rgb: np.ndarray, lab: np.ndarray, chroma_frac: float) -> int:
+    unique = _fast_unique_count(rgb)
+    base = _best_k(lab, chroma_frac)
+    if unique > 20_000:
+        return max(base, 14)
+    if unique > 5_000:
+        return max(base, 12)
+    return base
 
 
 def _majority_filter(labels: np.ndarray, passes: int = 1) -> np.ndarray:
@@ -335,6 +447,149 @@ def _fast_unique_count(rgb: np.ndarray) -> int:
     return int(np.unique(flat, axis=0).shape[0])
 
 
+def _sharpness(rgb: np.ndarray) -> float:
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def _is_grayscale_dither(rgb: np.ndarray, unique: int) -> bool:
+    """Detect anti-aliased B/W dither patterns (reference BMP style)."""
+    if unique > 64:
+        return False
+    flat = rgb.reshape(-1, 3)
+    if flat.shape[0] > 40_000:
+        rng = np.random.default_rng(1)
+        flat = flat[rng.choice(flat.shape[0], 40_000, replace=False)]
+    if not (np.all(flat[:, 0] == flat[:, 1]) and np.all(flat[:, 1] == flat[:, 2])):
+        return False
+    return _sharpness(rgb) > 500
+
+
+def _snap_binary_dither(rgb: np.ndarray) -> np.ndarray:
+    """Convert gray anti-alias pixels to pure black/white, keeping dither layout."""
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    bw = np.where(gray >= 128, 255, 0).astype(np.uint8)
+    return np.stack([bw, bw, bw], axis=-1)
+
+
+def _is_weaving_ready(rgb: np.ndarray, unique: int) -> bool:
+    """True when the source is already a sharp weaving/BMP-style design."""
+    sharp = _sharpness(rgb)
+    if unique <= 20:
+        return True
+    if unique <= 64 and sharp > 500:
+        return True
+    if unique <= 128 and sharp > 5000:
+        return True
+    return False
+
+
+def _pack_rgb(pixels: np.ndarray) -> np.ndarray:
+    p = pixels.astype(np.uint32)
+    return p[:, 0] * 65536 + p[:, 1] * 256 + p[:, 2]
+
+
+def _unpack_rgb(packed: int) -> np.ndarray:
+    return np.array([(packed >> 16) & 255, (packed >> 8) & 255, packed & 255], dtype=np.uint8)
+
+
+def _block_mode_downscale(rgb: np.ndarray, sw: int, sh: int) -> np.ndarray:
+    """Majority-color downscale — keeps stippling/hatching sharp (no blur)."""
+    h, w = rgb.shape[:2]
+    bh = max(1, h // sh)
+    bw = max(1, w // sw)
+    trim_h, trim_w = sh * bh, sw * bw
+    blocks = rgb[:trim_h, :trim_w].reshape(sh, bh, sw, bw, 3)
+    out = np.zeros((sh, sw, 3), dtype=np.uint8)
+    for y in range(sh):
+        for x in range(sw):
+            packed = _pack_rgb(blocks[y, :, x, :, :].reshape(-1, 3))
+            vals, counts = np.unique(packed, return_counts=True)
+            out[y, x] = _unpack_rgb(int(vals[np.argmax(counts)]))
+    return out
+
+
+def _labels_to_rgb(labels: np.ndarray, palette_lab: np.ndarray, ref_rgb: np.ndarray) -> np.ndarray:
+    palette_bgr = cv2.cvtColor(
+        np.clip(palette_lab, 0, 255).astype(np.uint8).reshape(-1, 1, 3),
+        cv2.COLOR_LAB2BGR,
+    )
+    palette_rgb = cv2.cvtColor(palette_bgr, cv2.COLOR_BGR2RGB).reshape(-1, 3)
+    palette_rgb = _flatten_palette_rgb(palette_rgb, ref_rgb)
+    return palette_rgb[labels]
+
+
+def _quantize_colorful_design(
+    rgb: np.ndarray,
+    *,
+    target_k: int,
+) -> tuple[np.ndarray, int]:
+    """Edge-aware solid inks for multi-color kalamkari / block-print art."""
+    work = _snap_denoise(rgb, step=8)
+    k = int(np.clip(target_k, 4, 16))
+    out, _ = quantize_to_solid_pixels(work, max_colors=k, strict=True)
+    outline = _outline_mask(work)
+    if np.any(outline):
+        uniq = np.unique(out.reshape(-1, 3), axis=0)
+        dark = uniq[np.argmin(uniq.astype(np.int32).sum(axis=1))]
+        out = out.copy()
+        out[outline] = dark
+    actual = int(np.unique(out.reshape(-1, 3), axis=0).shape[0])
+    return out, actual
+
+
+def _quantize_to_inks(
+    rgb: np.ndarray,
+    *,
+    target_k: int,
+    preserve_detail: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build limited solid-ink palette and per-pixel labels at full working resolution."""
+    step = 8 if preserve_detail else 16
+    work = _snap_denoise(rgb, step=step)
+    lab = _to_lab(work)
+    outline = _outline_mask(work)
+    edge_protect = outline
+    chroma = np.hypot(lab[:, :, 1] - 128.0, lab[:, :, 2] - 128.0)
+    chroma_frac = float(np.mean(chroma > 16))
+    k = int(np.clip(target_k, 3, 16))
+
+    start_k = min(16, max(k, 12 if chroma_frac >= 0.25 else k))
+    centers, labels, _ = _kmeans_lab(lab, start_k)
+
+    if preserve_detail:
+        merge_de, merge_dl = 7.5, 10.0
+        same_hue_de, same_hue_dl = 6.0, 10.0
+        min_frac = 0.0004
+    else:
+        merge_de, merge_dl = 10.5, 16.0
+        same_hue_de, same_hue_dl = 12.0, 20.0
+        min_frac = 0.001
+
+    merged_lab = _agglomerative_merge(
+        centers,
+        labels,
+        max_de=merge_de,
+        max_dl=merge_dl,
+        same_hue_de=same_hue_de,
+        same_hue_dl=same_hue_dl,
+        min_colors=k,
+    )
+    labels = _relabel_to_palette(lab, merged_lab)
+    if k < 12:
+        merged_lab, labels = _snap_neutral_mids(merged_lab, labels)
+    labels = _lock_outline_ink(labels, merged_lab, outline)
+    labels = _remove_fringe_labels(labels, edge_protect)
+    labels = _smooth_fill_labels(labels, edge_protect, passes=2)
+    if not preserve_detail:
+        merged_lab, labels = _recover_accents(lab, merged_lab, labels)
+        labels = _majority_filter(labels, passes=1)
+    merged_lab, labels = _prune_tiny_inks(merged_lab, labels, min_frac=min_frac)
+    labels = _remove_specks(labels, merged_lab)
+    labels = _lock_outline_ink(labels, merged_lab, outline)
+    return merged_lab, labels, lab
+
+
 _PIXEL_CELL = {"soft": 2, "medium": 3, "hard": 4, "extreme": 6}
 
 
@@ -344,20 +599,53 @@ def to_saree_print_layout(
     color_count: int | None = None,
 ) -> tuple[np.ndarray, int]:
     """
-    Mill BMP look: coarse grid → solid inks → nearest-neighbor squares.
-    Tuned for free-tier hosts (fast, low memory).
+    Mill BMP look: solid inks, sharp pixel blocks, preserved stippling/hatching.
     """
+    orig_h, orig_w = rgb.shape[:2]
     rgb = _collapse_uniform_blocks(rgb)
     unique = _fast_unique_count(rgb)
-    if unique <= 24:
-        return rgb, unique
+
+    if _is_weaving_ready(rgb, unique):
+        if _is_grayscale_dither(rgb, unique):
+            out = _snap_binary_dither(rgb)
+            return out, 2
+
+        if unique <= 16:
+            return rgb, unique
+
+        lab = _to_lab(rgb)
+        chroma = np.hypot(lab[:, :, 1] - 128.0, lab[:, :, 2] - 128.0)
+        chroma_frac = float(np.mean(chroma > 16))
+        k = int(color_count) if color_count else _estimate_ink_count(rgb, lab, chroma_frac)
+        k = int(np.clip(k, 3, 16))
+        if unique > 5000:
+            return _quantize_colorful_design(rgb, target_k=k)
+        merged_lab, labels, _ = _quantize_to_inks(rgb, target_k=k, preserve_detail=True)
+        out = _labels_to_rgb(labels, merged_lab, rgb)
+        actual = int(np.unique(out.reshape(-1, 3), axis=0).shape[0])
+        return out, actual
 
     cell = int(_PIXEL_CELL.get(block_strength, 4))
     h, w = rgb.shape[:2]
-    # Cap working resolution so k-means stays under free Render limits.
     longest = max(h, w)
-    if longest > 1400:
-        f = 1400 / longest
+
+    # Native-resolution scans: quantize in place — do not blur stippling first.
+    if longest <= 1600:
+        lab = _to_lab(rgb)
+        chroma = np.hypot(lab[:, :, 1] - 128.0, lab[:, :, 2] - 128.0)
+        chroma_frac = float(np.mean(chroma > 16))
+        k = int(color_count) if color_count else _estimate_ink_count(rgb, lab, chroma_frac)
+        k = int(np.clip(k, 4, 16))
+        if unique > 5000:
+            return _quantize_colorful_design(rgb, target_k=k)
+        merged_lab, labels, _ = _quantize_to_inks(rgb, target_k=k, preserve_detail=True)
+        out = _labels_to_rgb(labels, merged_lab, rgb)
+        actual = int(np.unique(out.reshape(-1, 3), axis=0).shape[0])
+        return out, actual
+
+    # Very large photos: coarse grid with block-mode downscale (not INTER_AREA).
+    if longest > 2000:
+        f = 2000 / longest
         rgb = cv2.resize(
             rgb,
             (max(8, int(w * f)), max(8, int(h * f))),
@@ -367,36 +655,16 @@ def to_saree_print_layout(
 
     sw = max(8, w // cell)
     sh = max(8, h // cell)
-    small = cv2.resize(rgb, (sw, sh), interpolation=cv2.INTER_AREA)
+    small = _block_mode_downscale(rgb, sw, sh)
 
     lab = _to_lab(small)
     chroma = np.hypot(lab[:, :, 1] - 128.0, lab[:, :, 2] - 128.0)
     chroma_frac = float(np.mean(chroma > 16))
-    k = int(color_count) if color_count else _best_k(lab, chroma_frac)
-    k = int(np.clip(k, 3, 12))
+    k = int(color_count) if color_count else _estimate_ink_count(small, lab, chroma_frac)
+    k = int(np.clip(k, 4, 16))
+    merged_lab, labels, _ = _quantize_to_inks(small, target_k=k, preserve_detail=True)
+    small_q = _labels_to_rgb(labels, merged_lab, small)
 
-    start_k = min(10, max(k, 8 if chroma_frac >= 0.25 else k))
-    centers, labels, _ = _kmeans_lab(lab, start_k)
-    merged_lab = _agglomerative_merge(
-        centers,
-        labels,
-        max_de=10.5,
-        max_dl=16,
-        same_hue_de=18.0,
-        same_hue_dl=36.0,
-    )
-    labels = _relabel_to_palette(lab, merged_lab)
-    merged_lab, labels = _snap_neutral_mids(merged_lab, labels)
-    merged_lab, labels = _prune_tiny_inks(merged_lab, labels, min_frac=0.001)
-
-    palette_bgr = cv2.cvtColor(
-        np.clip(merged_lab, 0, 255).astype(np.uint8).reshape(-1, 1, 3),
-        cv2.COLOR_LAB2BGR,
-    )
-    palette_rgb = cv2.cvtColor(palette_bgr, cv2.COLOR_BGR2RGB).reshape(-1, 3)
-    palette_rgb = _flatten_palette_rgb(palette_rgb, small)
-    small_q = palette_rgb[labels]
-
-    out = cv2.resize(small_q, (sw * cell, sh * cell), interpolation=cv2.INTER_NEAREST)
+    out = cv2.resize(small_q, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
     actual = int(np.unique(out.reshape(-1, 3), axis=0).shape[0])
     return out, actual
